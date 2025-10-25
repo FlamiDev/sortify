@@ -1,20 +1,16 @@
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, FuzzySelect, Input};
-use spotify_rs::auth::{NoVerifier, Token};
-use spotify_rs::client::Client;
 use spotify_rs::model::PlayableItem;
-use spotify_rs::{AuthCodeClient, AuthCodeFlow, RedirectUrl};
+use spotify_rs::{AuthCodeClient, RedirectUrl, Token};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::time::Duration;
 use tokio::time::sleep;
 
-type Spotify = Client<Token, AuthCodeFlow, NoVerifier>;
-
-async fn program(client: &mut Spotify) -> bool {
+async fn program(client: &mut AuthCodeClient<Token>) -> bool {
     let theme: ColorfulTheme = ColorfulTheme::default();
 
-    let Ok(track) = client.get_currently_playing_track(None).await else {
+    let Ok(track) = spotify_rs::get_currently_playing_track(None, client).await else {
         return false;
     };
     let Some(track) = track.item else {
@@ -22,17 +18,17 @@ async fn program(client: &mut Spotify) -> bool {
     };
     let track = Track::from_playable_item(track);
 
-    let Ok(user) = client.get_current_user_profile().await else {
+    let Ok(user) = spotify_rs::get_current_user_profile(client).await else {
         println!("Failed to get user profile!");
         return false;
     };
 
-    let Ok(playlists) = client.current_user_playlists().limit(50).get().await else {
+    let Ok(playlists) = spotify_rs::current_user_playlists().limit(50).get(client).await else {
         println!("Failed to get user playlists!");
         return false;
     };
     let playlists: Vec<_> = playlists
-        .items
+        .filtered_items()
         .into_iter()
         .filter(|p| p.owner.id == user.id)
         .collect();
@@ -61,29 +57,35 @@ async fn program(client: &mut Spotify) -> bool {
 
     match selection {
         0 => {
-            if let Err(_) = client.skip_to_next(None).await {
-                println!("Failed to skip to next track!");
-            }
+            save_current_track(client).await;
+            let _ = spotify_rs::skip_to_next(None, client).await;
+            sleep(Duration::from_secs(1)).await;
+            return true;
         }
         1 => return true,
         2 => {
-            if let Err(_) = client.remove_saved_tracks(&[track.uri.as_str()]).await {
+            if spotify_rs::remove_saved_tracks(&[track.id.as_str()], client)
+                .await
+                .is_err()
+            {
                 println!("Failed to remove track from library!");
             };
-            if let Err(_) = client.skip_to_next(None).await {
-                println!("Failed to skip to next track!");
-            };
+            let _ = spotify_rs::skip_to_next(None, client).await;
+            sleep(Duration::from_secs(1)).await;
+            return true;
         }
         3 => return false,
         i => {
             if i < items_len {
                 panic!("Selected an action that isn't implemented yet!");
             }
+            save_current_track(client).await;
             let playlist_id = playlist_ids[i - items_len];
-            if let Err(_) = client
-                .add_items_to_playlist(playlist_id, &[track.uri.as_str()])
-                .send()
+            if spotify_rs::
+                add_items_to_playlist(playlist_id, &[track.uri.as_str()])
+                .send(client)
                 .await
+                .is_err()
             {
                 println!(
                     "Failed to add track to playlist!\nTrack: {}\nPlaylist: {}",
@@ -106,7 +108,7 @@ async fn program(client: &mut Spotify) -> bool {
 async fn main() {
     let theme: ColorfulTheme = ColorfulTheme::default();
 
-    let mut spotify = match auth().await {
+    let mut client = match auth().await {
         Ok(s) => s,
         Err(e) => {
             println!("Failed to authenticate, {}", e);
@@ -116,19 +118,19 @@ async fn main() {
 
     if let Ok(mut f) = File::open("last.txt") {
         let mut last = String::new();
-        if let Err(_) = f.read_to_string(&mut last) {
+        if f.read_to_string(&mut last).is_err() {
             println!("Failed to read last.txt");
             return;
         };
-        let Ok(user) = spotify.get_current_user_profile().await else {
+        let Ok(user) = spotify_rs::get_current_user_profile(&client).await else {
             println!("Failed to get user profile!");
             return;
         };
-        if let Err(e) = spotify
-            .start_playback()
+        if let Err(e) = spotify_rs::
+            start_playback()
             .context_uri(format!("spotify:user:{}:collection", user.id))
             .offset_uri(last.as_str())
-            .send()
+            .send(&client)
             .await
         {
             println!("Failed to resume because {}", e);
@@ -144,10 +146,17 @@ async fn main() {
         }
     }
 
-    while program(&mut spotify).await {}
+    let _ = spotify_rs::toggle_playback_shuffle(false).send(&client).await;
 
-    if let Some(last) = spotify
-        .get_currently_playing_track(None)
+    while program(&mut client).await {}
+
+    save_current_track(&mut client).await;
+}
+
+async fn save_current_track(
+    client: &mut AuthCodeClient<Token>,
+) {
+    if let Some(last) = spotify_rs::get_currently_playing_track(None, client)
         .await
         .ok()
         .and_then(|i| i.item)
@@ -157,7 +166,7 @@ async fn main() {
             return;
         };
         let uri = Track::from_playable_item(last).uri;
-        if let Err(_) = f.write(uri.as_bytes()) {
+        if f.write(uri.as_bytes()).is_err() {
             println!("Failed to write to last.txt");
         };
     }
@@ -165,6 +174,7 @@ async fn main() {
 
 struct Track {
     uri: String,
+    id: String,
     name: String,
     artists: Vec<String>,
 }
@@ -174,11 +184,13 @@ impl Track {
         match item {
             PlayableItem::Track(t) => Self {
                 uri: t.uri,
+                id: t.id,
                 name: t.name,
                 artists: t.artists.iter().map(|a| a.name.clone()).collect(),
             },
             PlayableItem::Episode(e) => Self {
                 uri: e.uri,
+                id: e.id,
                 name: e.name,
                 artists: vec![e.show.name],
             },
@@ -186,51 +198,48 @@ impl Track {
     }
 }
 
-async fn auth() -> Result<Client<Token, AuthCodeFlow, NoVerifier>, String> {
+const CLIENT_ID: &str = "dd5192114eb24212b167e154bb908a4c";
+const CLIENT_SECRET: &str = "41918c7f458d49ca841537960cc0682e";
+const REDIRECT_URI: &str = "https://playlistjockeycallback.flami.dev";
+const SCOPES: [&str; 12] = [
+    "user-read-playback-state",
+    "user-modify-playback-state",
+    "user-read-currently-playing",
+    "playlist-read-private",
+    "playlist-read-collaborative",
+    "playlist-modify-private",
+    "playlist-modify-public",
+    "user-read-recently-played",
+    "user-library-modify",
+    "user-library-read",
+    "user-read-private",
+    "user-read-email",
+];
+const AUTH_TOKEN_FILE: &str = "token.txt";
+
+async fn auth() -> Result<AuthCodeClient<Token>, String> {
     let theme: ColorfulTheme = ColorfulTheme::default();
 
     let auto_refresh = true;
-    let scopes: Vec<String> = vec![
-        "user-read-playback-state",
-        "user-modify-playback-state",
-        "user-read-currently-playing",
-        "playlist-read-private",
-        "playlist-read-collaborative",
-        "playlist-modify-private",
-        "playlist-modify-public",
-        "user-read-recently-played",
-        "user-library-modify",
-        "user-library-read",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
 
-    if let Ok(mut f) = File::open("token.txt") {
+    if let Ok(mut f) = File::open(AUTH_TOKEN_FILE) {
         let mut token = String::new();
         f.read_to_string(&mut token)
             .map_err(|_| "token.txt exists but couldn't read it")?;
-        let auth_code_flow = AuthCodeFlow::new(
-            "dd5192114eb24212b167e154bb908a4c",
-            "41918c7f458d49ca841537960cc0682e",
-            &scopes,
-        );
+        let token = serde_json::from_str(&token).map_err(|_| "token.txt exists but couldn't parse it")?;
         if let Ok(client) =
-            Client::from_refresh_token(auth_code_flow, auto_refresh, token.clone()).await
+            AuthCodeClient::from_access_token(CLIENT_ID, CLIENT_SECRET, auto_refresh, token).await
         {
             println!("Authenticated using existing token!");
             return Ok(client);
         }
+        println!("Existing token is invalid, need to re-authenticate");
     }
 
-    let auth_code_flow = AuthCodeFlow::new(
-        "dd5192114eb24212b167e154bb908a4c",
-        "41918c7f458d49ca841537960cc0682e",
-        &scopes,
-    );
-    let redirect_url =
-        RedirectUrl::new("https://playlistjockeycallback.flami.dev".to_owned()).unwrap();
-    let (client, url) = AuthCodeClient::new(auth_code_flow, redirect_url, auto_refresh);
+    let redirect_url = RedirectUrl::new(REDIRECT_URI.to_string())
+        .map_err(|_| "REDIRECT_URI is not a valid URL")?;
+    let (client, url) =
+        AuthCodeClient::new(CLIENT_ID, CLIENT_SECRET, SCOPES, redirect_url, auto_refresh);
     println!("Open this URL in your browser: {}", url);
     let url: String = Input::with_theme(&theme)
         .with_prompt("Enter the URL you were redirected to")
@@ -247,11 +256,17 @@ async fn auth() -> Result<Client<Token, AuthCodeFlow, NoVerifier>, String> {
         .authenticate(code, state)
         .await
         .map_err(|_| "final login call went wrong")?;
-    if let Some(token) = spotify.refresh_token() {
-        let mut f = File::create("token.txt").map_err(|_| "could not create token.txt")?;
-        f.write(token.as_bytes())
-            .map_err(|_| "could not write to token.txt")?;
-    };
+    let mut file =
+        File::create(AUTH_TOKEN_FILE).map_err(|_| "couldn't create token.txt to save the token")?;
+    let token = spotify
+        .token()
+        .read()
+        .map(|t| t.clone())
+        .map_err(|_| "couldn't read token from client")?;
+    let json_token =
+        serde_json::to_string(&token).map_err(|_| "couldn't serialize token to json")?;
+    file.write_all(json_token.as_bytes())
+        .map_err(|_| "couldn't write to token.txt")?;
     println!("Authentication successful!");
     Ok(spotify)
 }

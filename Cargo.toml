@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-dialoguer = { version = "0.11.0", features = ["fuzzy-select"] }
-spotify-rs = { path = "spotify-rs" }
-tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "macros"] }
+dialoguer = { version = "0.12.0", features = ["fuzzy-select"] }
+spotify-rs = { version = "0.4.1" }
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros"] }
+serde_json = "1.0.138"
